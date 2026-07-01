@@ -1,0 +1,16 @@
+{
+  "name": "kfast",
+  "version": "1.0.0",
+  "description": "A fast.com speed test for the terminal — zero dependencies.",
+  "type": "module",
+  "bin": {
+    "kfast": "kfast.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "kfast.mjs"
+  ],
+  "license": "MIT"
+}
