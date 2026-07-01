@@ -82,7 +82,7 @@ usage: kfast [options]
   -v, --version           show version
 `;
 
-const VERSION = "1.0.0";
+const VERSION = "0.2.0";
 
 function parseArgs(argv) {
   const o = {
