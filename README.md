@@ -49,6 +49,10 @@ Press `esc` or `q` to stop early with partial results; `Ctrl-C` aborts.
 npm link   # then run: kfast
 ```
 
+## Author
+
+Wrote this for myself to use and as a research into agentic workflows.
+
 ## License
 
 MIT
