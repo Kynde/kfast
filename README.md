@@ -2,7 +2,11 @@
 
 A [fast.com](https://fast.com) speed test for the terminal. Single file, zero dependencies, Node ≥ 18.
 
-Live 3-row TUI (gradient bar + sparkline) while running, then a fast.com-style summary: download/upload Mbps, unloaded and loaded latency, client and server.
+Live 3-row TUI (gradient bar + sparkline) while running:
+
+![kfast running](docs/kfast-sshot.png)
+
+then a fast.com-style summary: download/upload Mbps, unloaded and loaded latency, client and server.
 
 ```
 ↓ Download   59.1 Mbps
