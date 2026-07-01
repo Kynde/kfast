@@ -95,16 +95,21 @@ function parseArgs(argv) {
     json: false,
     plain: false,
     noColor: false,
-    _rr: 0,
   };
   const next = (i, name) => {
     const v = argv[i + 1];
     if (v === undefined) fail(`missing value for ${name}`);
     return v;
   };
-  const num = (v, name) => {
+  const positiveNum = (v, name) => {
     const n = Number(v);
     if (!Number.isFinite(n) || n <= 0) fail(`invalid number for ${name}: ${v}`);
+    return n;
+  };
+  const positiveInt = (v, name) => {
+    const n = Number(v);
+    if (!Number.isSafeInteger(n) || n <= 0)
+      fail(`invalid integer for ${name}: ${v}`);
     return n;
   };
   let upload = false;
@@ -116,12 +121,12 @@ function parseArgs(argv) {
       case "-v": case "--version": write(VERSION + "\n"); process.exit(0); break;
       case "-u": case "--upload": upload = true; break;
       case "--both": both = true; break;
-      case "-c": case "--connections": o.connections = num(next(i, a), a); i++; break;
-      case "-n": case "--url-count": o.urlCount = num(next(i, a), a); i++; break;
-      case "--min-duration": o.minDuration = num(next(i, a), a); i++; break;
-      case "--max-duration": o.maxDuration = num(next(i, a), a); i++; break;
+      case "-c": case "--connections": o.connections = positiveInt(next(i, a), a); i++; break;
+      case "-n": case "--url-count": o.urlCount = positiveInt(next(i, a), a); i++; break;
+      case "--min-duration": o.minDuration = positiveNum(next(i, a), a); i++; break;
+      case "--max-duration": o.maxDuration = positiveNum(next(i, a), a); i++; break;
       case "-d": case "--duration": {
-        const d = num(next(i, a), a); o.minDuration = d; o.maxDuration = d; i++; break;
+        const d = positiveNum(next(i, a), a); o.minDuration = d; o.maxDuration = d; i++; break;
       }
       case "--no-https": o.https = false; break;
       case "--json": o.json = true; break;
@@ -130,8 +135,6 @@ function parseArgs(argv) {
       default: fail(`unknown option: ${a}`);
     }
   }
-  o.connections = Math.round(o.connections);
-  o.urlCount = Math.round(o.urlCount);
   if (o.maxDuration < o.minDuration) o.maxDuration = o.minDuration;
   o.mode = both ? "both" : upload ? "upload" : "download";
   return o;
@@ -189,7 +192,7 @@ async function getTargets(token, https, urlCount) {
 
 // build a ranged measurement URL from a target url
 const rangeUrl = (targetUrl, bytes) =>
-  targetUrl.replace("/speedtest?", `/speedtest/range/0-${bytes}?`);
+  targetUrl.replace("/speedtest?", `/speedtest/range/0-${bytes - 1}?`);
 
 const DL_CHUNK = 26_214_400; // 25 MiB per request, worker re-issues as needed
 const UP_CHUNK = 26_214_400;
@@ -219,14 +222,15 @@ async function measureUnloaded(targetUrl, n = 6) {
 
 // ─── workers ──────────────────────────────────────────────────────────────────
 
-async function downloadWorker(state, ctl, targets) {
+async function downloadWorker(state, ctl, nextTarget) {
   while (!state.stopped) {
-    const t = targets[ARGS._rr++ % targets.length];
+    const t = nextTarget();
     try {
       const res = await fetch(rangeUrl(t.url, DL_CHUNK), {
         ...UA,
         signal: ctl.signal,
       });
+      if (!res.ok || !res.body) throw new Error(`download target returned ${res.status}`);
       for await (const chunk of res.body) {
         state.bytes += chunk.length;
         if (state.stopped) break;
@@ -241,34 +245,40 @@ async function downloadWorker(state, ctl, targets) {
 // a ReadableStream that emits up to `size` bytes, counting as the socket pulls
 function uploadStream(size, state) {
   let sent = 0;
-  return new ReadableStream({
-    pull(controller) {
-      if (sent >= size || state.stopped) {
-        controller.close();
-        return;
-      }
-      const remaining = size - sent;
-      const chunk =
-        remaining < UP_BLOCK.length ? UP_BLOCK.subarray(0, remaining) : UP_BLOCK;
-      controller.enqueue(chunk);
-      sent += chunk.length;
-      state.bytes += chunk.length;
-    },
-  });
+  return {
+    body: new ReadableStream({
+      pull(controller) {
+        if (sent >= size || state.stopped) {
+          controller.close();
+          return;
+        }
+        const remaining = size - sent;
+        const chunk =
+          remaining < UP_BLOCK.length ? UP_BLOCK.subarray(0, remaining) : UP_BLOCK;
+        controller.enqueue(chunk);
+        sent += chunk.length;
+        state.bytes += chunk.length;
+      },
+    }),
+    sent: () => sent,
+  };
 }
 
-async function uploadWorker(state, ctl, targets) {
+async function uploadWorker(state, ctl, nextTarget) {
   while (!state.stopped) {
-    const t = targets[ARGS._rr++ % targets.length];
+    const t = nextTarget();
+    const stream = uploadStream(UP_CHUNK, state);
     try {
-      await fetch(rangeUrl(t.url, UP_CHUNK), {
+      const res = await fetch(rangeUrl(t.url, UP_CHUNK), {
         ...UA,
         method: "POST",
-        body: uploadStream(UP_CHUNK, state),
+        body: stream.body,
         duplex: "half",
         signal: ctl.signal,
       });
+      if (!res.ok) throw new Error(`upload target returned ${res.status}`);
     } catch {
+      if (!state.stopped) state.bytes -= stream.sent();
       if (state.stopped) return;
       await sleep(50);
     }
@@ -310,8 +320,8 @@ function sparkline(samples, peak, stops) {
 
 let blockRendered = false;
 
-function renderFrame(kind, view) {
-  if (ARGS.plain || !process.stdout.isTTY) return;
+function renderFrame(kind, view, opts) {
+  if (opts.plain || !process.stdout.isTTY) return;
   const isUp = kind === "upload";
   const stops = isUp ? UP_STOPS : DOWN_STOPS;
   const arrow = isUp ? "↑" : "↓";
@@ -330,7 +340,7 @@ function renderFrame(kind, view) {
   )}`;
   const l3 = dim(
     ` latency ${fmtMs(view.latency)} ms · ${view.elapsed.toFixed(1)}s · ${
-      ARGS.connections
+      opts.connections
     } conns · peak ${fmtSpeed(view.peak)} · esc to quit`,
   );
 
@@ -341,12 +351,14 @@ function renderFrame(kind, view) {
 
 // ─── measurement phase ──────────────────────────────────────────────────────────
 
-async function runPhase(kind, targets) {
+async function runPhase(kind, targets, opts) {
   const state = { bytes: 0, stopped: false };
   const ctl = new AbortController();
+  let targetIndex = 0;
+  const nextTarget = () => targets[targetIndex++ % targets.length];
   const workerFn = kind === "upload" ? uploadWorker : downloadWorker;
-  const workers = Array.from({ length: ARGS.connections }, () =>
-    workerFn(state, ctl, targets),
+  const workers = Array.from({ length: opts.connections }, () =>
+    workerFn(state, ctl, nextTarget),
   );
 
   const loadedPings = [];
@@ -374,7 +386,7 @@ async function runPhase(kind, targets) {
     const iv = setInterval(() => {
       const now = performance.now();
       const dt = (now - lastT) / 1000;
-      const db = state.bytes - lastB;
+      const db = Math.max(0, state.bytes - lastB);
       lastT = now;
       lastB = state.bytes;
       const inst = dt > 0 ? (db * 8) / 1e6 / dt : 0; // Mbps this tick
@@ -387,8 +399,8 @@ async function runPhase(kind, targets) {
       const elapsed = (now - start) / 1000;
       const latency = median(loadedPings);
 
-      renderFrame(kind, { mbps: smoothed, peak, spark, latency, elapsed });
-      if (ARGS.plain && now - lastPlain > 1000) {
+      renderFrame(kind, { mbps: smoothed, peak, spark, latency, elapsed }, opts);
+      if (opts.plain && now - lastPlain > 1000) {
         lastPlain = now;
         write(
           `${kind}: ${fmtSpeed(smoothed)} Mbps  (${elapsed.toFixed(0)}s)\n`,
@@ -396,8 +408,8 @@ async function runPhase(kind, targets) {
       }
 
       const stable =
-        elapsed >= ARGS.minDuration && cov(samples.slice(-10)) < 0.05;
-      if (control.interrupted || elapsed >= ARGS.maxDuration || stable) {
+        elapsed >= opts.minDuration && cov(samples.slice(-10)) < 0.05;
+      if (control.interrupted || elapsed >= opts.maxDuration || stable) {
         clearInterval(iv);
         resolve();
       }
@@ -426,10 +438,10 @@ function uniqueLocations(targets) {
   return out;
 }
 
-function printResults(res) {
+function printResults(res, opts) {
   const { client, unloaded, download, upload, targets } = res;
 
-  if (ARGS.json) {
+  if (opts.json) {
     write(
       JSON.stringify(
         {
@@ -488,7 +500,8 @@ function printResults(res) {
   const locs = uniqueLocations(targets);
   write(
     `  ${label("Server")}${locs.join(dim(" · "))} ${dim(
-      `(${targets.length} conn${targets.length > 1 ? "s" : ""})`,
+      `(${opts.connections} conn${opts.connections > 1 ? "s" : ""}, ` +
+        `${targets.length} target${targets.length > 1 ? "s" : ""})`,
     )}\n`,
   );
 }
@@ -557,11 +570,11 @@ async function main() {
     const wantDownload = ARGS.mode === "download" || ARGS.mode === "both";
     const wantUpload = ARGS.mode === "upload" || ARGS.mode === "both";
     if (wantDownload && !control.interrupted)
-      download = await runPhase("download", targets);
+      download = await runPhase("download", targets, ARGS);
     if (wantUpload && !control.interrupted)
-      upload = await runPhase("upload", targets);
+      upload = await runPhase("upload", targets, ARGS);
 
-    printResults({ client, unloaded, download, upload, targets });
+    printResults({ client, unloaded, download, upload, targets }, ARGS);
     if (control.interrupted && !ARGS.json)
       write(dim("  interrupted — partial results\n"));
   } catch (err) {
